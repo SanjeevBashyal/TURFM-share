@@ -13,6 +13,19 @@ from shapely.ops import nearest_points, unary_union
 DTMChannelModifier = None
 
 
+def _print_loop_progress(task, current, total, last_percent=None, every_percent=1):
+    if total <= 0:
+        return last_percent
+    percent = int((float(current) / float(total)) * 100)
+    percent = max(0, min(100, percent))
+    if last_percent is None or percent >= last_percent + every_percent or percent >= 100:
+        print(f"\r{task}: {percent:3d}%", end="", flush=True)
+        if percent >= 100:
+            print()
+        return percent
+    return last_percent
+
+
 class JunctionInterpolationMixin:
     """Junction overlay built from clipped bank lines and inner bed sections."""
 
@@ -74,13 +87,36 @@ class JunctionInterpolationMixin:
             )
             rows, cols = np.where(influence_mask == 1)
             cell_size = max(abs(transform.a), abs(transform.e), 1e-6)
+            progress_task = (
+                f"Junction interpolation progress "
+                f"{summary.get('junction', len(summaries) + 1)}"
+            )
+            last_progress = _print_loop_progress(progress_task, 0, len(rows))
 
-            for row, col in zip(rows, cols):
+            for cell_index, (row, col) in enumerate(zip(rows, cols), start=1):
+                last_progress = _print_loop_progress(
+                    progress_task,
+                    cell_index,
+                    len(rows),
+                    last_progress,
+                )
                 terrain_z = float(original[row, col])
                 current_z = float(updated[row, col])
                 if not np.isfinite(terrain_z) or not np.isfinite(current_z):
+                    last_progress = _print_loop_progress(
+                        progress_task,
+                        cell_index,
+                        len(rows),
+                        last_progress,
+                    )
                     continue
                 if nodata is not None and np.isclose(terrain_z, nodata):
+                    last_progress = _print_loop_progress(
+                        progress_task,
+                        cell_index,
+                        len(rows),
+                        last_progress,
+                    )
                     continue
 
                 x, y = transform * (col + 0.5, row + 0.5)
@@ -200,6 +236,12 @@ class JunctionInterpolationMixin:
                 updated[row, col] = float(blended_z)
                 if not np.isclose(current_z, blended_z):
                     summary["cells_updated"] += 1
+                last_progress = _print_loop_progress(
+                    progress_task,
+                    cell_index,
+                    len(rows),
+                    last_progress,
+                )
 
             summary["control_sections"] = [
                 {

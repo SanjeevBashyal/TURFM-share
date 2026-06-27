@@ -7,13 +7,13 @@ from Automation.DTM import DTM
 
 
 CONFIG_SOURCE = "folder"
-MASTER_PROJECT_PATH = r"C:\Users\Ripple\Desktop\1 Demonstrations\Project-Template"
+MASTER_PROJECT_PATH = r"D:\TUR_FM\Nepal_Organize\3.Packages\20260415\4_Recieved Data\Cycle-1\Group-3"
 
 # PROJECTS_TO_RUN: list[str] | None = None
 # PROJECTS_TO_RUN = ["BUYUKGOKCELI"]
 # PROJECTS_TO_RUN = ["ARDICLI", "CIGRI", "CUKUROREN", "CUKUROREN-T"]
 # PROJECTS_TO_RUN = ["ECE2", "EVCILER1", "KILCAN"]
-PROJECTS_TO_RUN = ["ARDICLI"]
+PROJECTS_TO_RUN = ["AKARCA"]
 
 TARGET_RES = 0.1
 BUFFER_M = 20

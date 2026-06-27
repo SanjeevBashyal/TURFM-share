@@ -8,8 +8,10 @@ from pathlib import Path
 
 
 DIRECT_RUN_SOURCE = "folder"
-DIRECT_RUN_MASTER_PROJECT_PATH = Path(r"C:\Users\Ripple\Desktop\1 Demonstrations\Project-Template")
+DIRECT_RUN_MASTER_PROJECT_PATH = Path(r"E:\TUR_FM\Nepal_Organize\3.Packages\20260415\4_Recieved Data\Cycle-1\Group-3copy")
 DIRECT_RUN_PREPARE_FULL_STRUCTURE = False
+BUR_INPUT_DIRNAME = "1 Bur"
+LEGACY_BUR_INPUT_DIRNAME = "1 Bur-Bur"
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,7 @@ class Config:
 
     This intentionally does not import or inherit from ``configProject.py``.
     It keeps only the folder layout needed by ``implementationDTM.py``:
-    ``0 Essentials``, ``1 Bur-Bur``, ``2 GIS``, ``3 DTM``, and ``Z Temp``.
+    ``0 Essentials``, ``1 Bur``, ``2 GIS``, ``3 DTM``, and ``Z Temp``.
     """
 
     structure_source: str = "folder"
@@ -176,7 +178,7 @@ class Config:
         for top_level_name in self._default_top_level_names():
             add_entry((top_level_name,))
 
-        bur_bur_path = root / "1 Bur-Bur"
+        bur_bur_path = self._resolve_bur_input_root(root)
         if bur_bur_path.is_dir():
             for project_dir in sorted(
                 [
@@ -189,13 +191,13 @@ class Config:
                 sub_project_dirs = [path for path in project_dir.iterdir() if path.is_dir()]
                 if not sub_project_dirs:
                     continue
-                add_entry(("1 Bur-Bur", project_dir.name))
+                add_entry((bur_bur_path.name, project_dir.name))
                 for sub_project_dir in sorted(
                     sub_project_dirs,
                     key=lambda item: (self._version_number(item.name), item.name.upper()),
                     reverse=True,
                 ):
-                    add_entry(("1 Bur-Bur", project_dir.name, sub_project_dir.name))
+                    add_entry((bur_bur_path.name, project_dir.name, sub_project_dir.name))
 
     def _ensure_top_level_entries(self):
         added = {entry.relative_parts for entry in self.FOLDER_ENTRIES}
@@ -226,7 +228,9 @@ class Config:
         self.PROJECT_LONG_NAME = self._project_long_name_from_short_name(self.PROJECT_SHORT_NAME)
 
         self.ESSENTIALS_PATH = self._configured_path_or_default("0 Essentials")
-        self.BUR_BUR_PATH = self._configured_path_or_default("1 Bur-Bur")
+        self.BUR_BUR_PATH = self._configured_path_or_default(
+            self._bur_input_relative_key()
+        )
         self.GIS_PATH = self._configured_path_or_default("2 GIS")
         self.DTM_OUTPUT_PATH = self._configured_path_or_default("3 DTM")
         self.DTM_PATH = self.DTM_OUTPUT_PATH
@@ -279,9 +283,9 @@ class Config:
         project_subprojects: dict[str, list[str]] = {}
         for entry in self.FOLDER_ENTRIES:
             parts = entry.relative_parts
-            if len(parts) == 2 and parts[0] == "1 Bur-Bur":
+            if len(parts) == 2 and self._is_bur_input_key(parts[0]):
                 project_subprojects.setdefault(parts[1], [])
-            elif len(parts) == 3 and parts[0] == "1 Bur-Bur":
+            elif len(parts) == 3 and self._is_bur_input_key(parts[0]):
                 project_subprojects.setdefault(parts[1], []).append(parts[2])
 
         if not project_name and project_subprojects:
@@ -572,16 +576,21 @@ class Config:
         project_subprojects: dict[str, list[str]] = {}
         for entry in self.FOLDER_ENTRIES:
             parts = entry.relative_parts
-            if len(parts) == 2 and parts[0] == "1 Bur-Bur":
+            if len(parts) == 2 and self._is_bur_input_key(parts[0]):
                 project_subprojects.setdefault(parts[1], [])
-            elif len(parts) == 3 and parts[0] == "1 Bur-Bur":
+            elif len(parts) == 3 and self._is_bur_input_key(parts[0]):
                 project_subprojects.setdefault(parts[1], []).append(parts[2])
         return {project: sub_projects for project, sub_projects in project_subprojects.items() if sub_projects}
 
     def get_essential_directories(self) -> list[Path]:
         directories = {Path(self.PROJECT_FOLDER)}
         for top_level_name in self._default_top_level_names():
-            directories.add(Path(self.PATHS.get(top_level_name, self._absolute_from_relative_path(top_level_name))))
+            relative_key = (
+                self._bur_input_relative_key()
+                if top_level_name == BUR_INPUT_DIRNAME
+                else top_level_name
+            )
+            directories.add(Path(self.PATHS.get(relative_key, self._absolute_from_relative_path(relative_key))))
         return sorted(directories, key=lambda item: (len(item.parts), str(item)))
 
     def setup_essential_directories(self):
@@ -744,6 +753,26 @@ class Config:
     def _clean_cell(value: str) -> str:
         return str(value).strip().strip('"')
 
+    @staticmethod
+    def _is_bur_input_key(value: str) -> bool:
+        return value in {BUR_INPUT_DIRNAME, LEGACY_BUR_INPUT_DIRNAME}
+
+    def _resolve_bur_input_root(self, root: Path) -> Path:
+        preferred = root / BUR_INPUT_DIRNAME
+        if preferred.is_dir():
+            return preferred
+        legacy = root / LEGACY_BUR_INPUT_DIRNAME
+        if legacy.is_dir():
+            return legacy
+        return preferred
+
+    def _bur_input_relative_key(self) -> str:
+        preferred = Path(self.PROJECT_FOLDER) / BUR_INPUT_DIRNAME
+        legacy = Path(self.PROJECT_FOLDER) / LEGACY_BUR_INPUT_DIRNAME
+        if not preferred.is_dir() and legacy.is_dir():
+            return LEGACY_BUR_INPUT_DIRNAME
+        return BUR_INPUT_DIRNAME
+
     @classmethod
     def _normalize_structure_source(cls, value: str | None) -> str:
         normalized = cls._clean_cell(value or "folder").lower()
@@ -761,9 +790,11 @@ class Config:
     def _default_top_level_names() -> tuple[str, ...]:
         return (
             "0 Essentials",
-            "1 Bur-Bur",
+            BUR_INPUT_DIRNAME,
             "2 GIS",
             "3 DTM",
+            "4 Hecras",
+            "5 Outputs",
             "Z Temp",
         )
 
@@ -787,7 +818,7 @@ class Config:
         project_candidates = [
             entry.relative_path.as_posix()
             for entry in self.FOLDER_ENTRIES
-            if entry.relative_parts and entry.relative_parts[0] == "1 Bur-Bur"
+            if entry.relative_parts and self._is_bur_input_key(entry.relative_parts[0])
         ]
         for target_name in (
             self.PROJECT_NAME,
@@ -804,10 +835,10 @@ class Config:
                 if candidate_name == target_name or self._normalize_name(candidate_name) == target_name:
                     return candidate
         if self.PROJECT_NAME:
-            return Path("1 Bur-Bur", self.PROJECT_NAME).as_posix()
+            return Path(self._bur_input_relative_key(), self.PROJECT_NAME).as_posix()
         if project_candidates:
             return project_candidates[0]
-        return Path("1 Bur-Bur", self.PROJECT_LONG_NAME).as_posix()
+        return Path(self._bur_input_relative_key(), self.PROJECT_LONG_NAME).as_posix()
 
     @staticmethod
     def _project_group_from_relative_path(relative_key: str) -> str:

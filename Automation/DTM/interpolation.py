@@ -24,6 +24,27 @@ from shapely.ops import linemerge, nearest_points, polygonize, split, unary_unio
 DTMChannelModifier = None
 
 
+def _print_percent(task, percent, detail=""):
+    percent = max(0.0, min(100.0, float(percent)))
+    suffix = f" - {detail}" if detail else ""
+    print(f"\r{task}: {percent:5.1f}%{suffix}", end="", flush=True)
+    if percent >= 100.0:
+        print()
+
+
+def _print_loop_progress(task, current, total, last_percent=None, every_percent=1):
+    if total <= 0:
+        return last_percent
+    percent = int((float(current) / float(total)) * 100)
+    percent = max(0, min(100, percent))
+    if last_percent is None or percent >= last_percent + every_percent or percent >= 100:
+        print(f"\r{task}: {percent:3d}%", end="", flush=True)
+        if percent >= 100:
+            print()
+        return percent
+    return last_percent
+
+
 class InterpolationMixin:
     """Reach and junction terrain interpolation routines."""
 
@@ -41,6 +62,10 @@ class InterpolationMixin:
         bank_offset_m=0.2,
         full_cross_section_weight_distance_m=1.5,
         transition_to_dtm_distance_m=3.5,
+        enforce_exact_cross_section_snap=False,
+        exact_cross_section_control=True,
+        exact_cross_section_control_distance_m=None,
+        exact_cross_section_control_hold_m=None,
         skewness_correction=True,
         centerline_normal_sample_distance_m=3.0,
     ):
@@ -195,14 +220,30 @@ class InterpolationMixin:
             default_value=1,
             dtype="uint8",
         )
+        in_bank_cells_added_to_xs_mask = int(
+            np.count_nonzero((bank_mask == 1) & (xs_mask == 0))
+        )
+        if in_bank_cells_added_to_xs_mask:
+            print(
+                "Adding "
+                f"{in_bank_cells_added_to_xs_mask} in-bank cell(s) to the "
+                "interpolation candidate mask outside the dynamic XS envelope."
+            )
+            xs_mask = np.maximum(xs_mask, bank_mask).astype("uint8")
+        modifier.in_bank_cells_added_to_interpolation_mask = in_bank_cells_added_to_xs_mask
 
         print(f"Iterating through {height} x {width} = {height * width} cells using vectorized arrays with {blend_type} blending...")
+        progress_task = "Reach interpolation progress"
+        _print_percent(progress_task, 0, "building interpolation mask")
         valid_rows, valid_cols = np.where(xs_mask == 1)
         if len(valid_rows) == 0:
+            _print_percent(progress_task, 100, "no cells inside interpolation mask")
             return [], modifier
 
+        _print_percent(progress_task, 8, f"{len(valid_rows)} candidate cells")
         d_bank_grid = distance_transform_edt(bank_mask == 0) * modifier.target_res
         d_bank_arr = d_bank_grid[valid_rows, valid_cols]
+        _print_percent(progress_task, 18, "computed bank-distance grid")
 
         hold_distance = max(float(full_cross_section_weight_distance_m), 0.0)
         transition_distance = max(float(transition_to_dtm_distance_m), 0.0)
@@ -233,11 +274,13 @@ class InterpolationMixin:
             w1_terrain[dtm_mask] = 1.0
             w2_cs[dtm_mask] = 0.0
 
+        _print_percent(progress_task, 26, "computed terrain/cross-section weights")
         xs, ys = modifier.dtm_transform * (valid_cols + 0.5, valid_rows + 0.5)
         dtm_zs = modifier.dtm_data[valid_rows, valid_cols].astype(float)
         
         cxs, cys, bws = modifier.get_cell_centerline_metrics(xs, ys)
         dists_cl = np.hypot(xs - cxs, ys - cys)
+        _print_percent(progress_task, 38, "mapped cells to centerline")
         
         cl_coords = np.array(centerline.coords)[:, :2]
         K = len(cl_coords)
@@ -275,6 +318,7 @@ class InterpolationMixin:
                 
             d_cells = cl_cum_dist[best_j] + best_t * np.hypot(cl_coords[best_j+1, 0] - cl_coords[best_j, 0], cl_coords[best_j+1, 1] - cl_coords[best_j, 1])
 
+        _print_percent(progress_task, 50, "located cells along centerline")
         signed_offsets, _ = DTMChannelModifier._cell_signed_offsets_and_bank_widths(
             centerline=centerline,
             bank_lines=bank_lines,
@@ -286,47 +330,28 @@ class InterpolationMixin:
             centerline_normal_sample_distance_m=centerline_normal_sample_distance_m,
         )
         dists_cl = np.abs(signed_offsets)
+        _print_percent(progress_task, 60, "computed signed offsets")
 
-        # Avoid extrapolating reach terrain into bank-line extensions beyond the
-        # first/last surveyed CSV cross-section.
-        cell_size = float(getattr(modifier, "target_res", 0.0))
-        xs_range_tolerance = min(max(cell_size * 0.01, 1e-6), 0.01)
+        # Endpoint cells are intentionally not clipped by surveyed XS chainage.
+        # Cells beyond the first/last XS retain the normal terminal-station
+        # behavior from searchsorted/clipped station indices below.
         min_xs_distance = float(d_xs_array[0])
         max_xs_distance = float(d_xs_array[-1])
-        within_xs_range = (
-            (d_cells >= min_xs_distance - xs_range_tolerance)
-            & (d_cells <= max_xs_distance + xs_range_tolerance)
+        upstream_beyond_mask = d_cells < min_xs_distance
+        downstream_beyond_mask = d_cells > max_xs_distance
+        modifier.endpoint_extrapolation_cells_skipped = 0
+        modifier.endpoint_terminal_apron_cells_included = int(
+            np.count_nonzero(upstream_beyond_mask | downstream_beyond_mask)
         )
-        skipped_extrapolated_cells = int(np.count_nonzero(~within_xs_range))
-        modifier.endpoint_extrapolation_cells_skipped = skipped_extrapolated_cells
-        if skipped_extrapolated_cells:
+        modifier.endpoint_upstream_apron_cells_included = int(np.count_nonzero(upstream_beyond_mask))
+        modifier.endpoint_downstream_apron_cells_included = int(np.count_nonzero(downstream_beyond_mask))
+        if modifier.endpoint_terminal_apron_cells_included:
             print(
-                f"Skipping {skipped_extrapolated_cells} reach interpolation cell(s) outside "
-                f"surveyed cross-section range ({min_xs_distance:.3f} m to {max_xs_distance:.3f} m) "
-                "to avoid endpoint extrapolation."
+                f"Retaining {modifier.endpoint_terminal_apron_cells_included} candidate cell(s) "
+                "outside the surveyed cross-section chainage range "
+                f"({modifier.endpoint_upstream_apron_cells_included} upstream, "
+                f"{modifier.endpoint_downstream_apron_cells_included} downstream)."
             )
-        if not np.any(within_xs_range):
-            print(
-                "No reach interpolation cells remain inside the surveyed cross-section range; "
-                "leaving this reach unchanged."
-            )
-            return [], modifier
-        if skipped_extrapolated_cells:
-            valid_rows = valid_rows[within_xs_range]
-            valid_cols = valid_cols[within_xs_range]
-            d_bank_arr = d_bank_arr[within_xs_range]
-            w1_terrain = w1_terrain[within_xs_range]
-            w2_cs = w2_cs[within_xs_range]
-            xs = xs[within_xs_range]
-            ys = ys[within_xs_range]
-            dtm_zs = dtm_zs[within_xs_range]
-            cxs = cxs[within_xs_range]
-            cys = cys[within_xs_range]
-            bws = bws[within_xs_range]
-            dists_cl = dists_cl[within_xs_range]
-            d_cells = d_cells[within_xs_range]
-            signed_offsets = signed_offsets[within_xs_range]
-            N = len(xs)
 
         idx_dn = np.searchsorted(d_xs_array, d_cells)
         idx_dn = np.clip(idx_dn, 1, len(d_xs_array) - 1)
@@ -336,11 +361,33 @@ class InterpolationMixin:
         dist_up_array = np.zeros(N)
         dist_dn_array = np.zeros(N)
         exact_cross_section_tolerance = max(float(modifier.target_res), 1e-6)
+        exact_cross_section_control_end_distance = (
+            max(float(exact_cross_section_control_distance_m), 1e-6)
+            if exact_cross_section_control_distance_m is not None
+            else max(float(modifier.target_res) * 5.0, 1e-6)
+        )
+        exact_cross_section_control_hold = (
+            max(float(exact_cross_section_control_hold_m), 0.0)
+            if exact_cross_section_control_hold_m is not None
+            else max(float(modifier.target_res) * 2.0, 0.0)
+        )
+        exact_cross_section_control_hold = min(
+            exact_cross_section_control_hold,
+            exact_cross_section_control_end_distance,
+        )
         
         has_shapely2 = hasattr(shapely, 'line_locate_point')
 
+        station_pair_count = max(len(stations_list) - 1, 1)
+        station_progress = None
         for i in range(len(stations_list) - 1):
             mask = (idx_up == i)
+            station_progress = _print_loop_progress(
+                "Station-pair interpolation progress",
+                i + 1,
+                station_pair_count,
+                station_progress,
+            )
             if not np.any(mask): continue
             
             st_up = stations_list[i]
@@ -352,6 +399,7 @@ class InterpolationMixin:
             dist_cl_m = dists_cl[mask]
             signed_offset_m = signed_offsets[mask]
             d_cell_m = d_cells[mask]
+            inside_bank_m = bank_mask[valid_rows[mask], valid_cols[mask]] == 1
             
             if has_shapely2:
                 pts_shp = shapely.points(x_m, y_m)
@@ -395,7 +443,15 @@ class InterpolationMixin:
 
             exact_up_mask = dist_up_m <= exact_cross_section_tolerance
             exact_dn_mask = dist_dn_m <= exact_cross_section_tolerance
-            if np.any(exact_up_mask) or np.any(exact_dn_mask):
+            control_up_mask = inside_bank_m & (dist_up_m <= exact_cross_section_control_end_distance)
+            control_dn_mask = inside_bank_m & (dist_dn_m <= exact_cross_section_control_end_distance)
+            exact_control_needed = (
+                np.any(exact_up_mask)
+                or np.any(exact_dn_mask)
+                or np.any(control_up_mask)
+                or np.any(control_dn_mask)
+            )
+            if exact_control_needed and (enforce_exact_cross_section_snap or exact_cross_section_control):
                 if has_shapely2:
                     raw_offset_up = shapely.line_locate_point(st_up["line"], pts_shp)
                     raw_offset_dn = shapely.line_locate_point(st_dn["line"], pts_shp)
@@ -419,11 +475,43 @@ class InterpolationMixin:
                 use_dn_exact = exact_dn_mask & (
                     ~exact_up_mask | (dist_dn_m < dist_up_m)
                 )
-                interpolated_z[use_up_exact] = z_exact_up[use_up_exact]
-                interpolated_z[use_dn_exact] = z_exact_dn[use_dn_exact]
+                if enforce_exact_cross_section_snap:
+                    interpolated_z[use_up_exact] = z_exact_up[use_up_exact]
+                    interpolated_z[use_dn_exact] = z_exact_dn[use_dn_exact]
+                elif exact_cross_section_control:
+                    use_up_control = control_up_mask & (
+                        ~control_dn_mask | (dist_up_m <= dist_dn_m)
+                    )
+                    use_dn_control = control_dn_mask & (
+                        ~control_up_mask | (dist_dn_m < dist_up_m)
+                    )
+                    nearest_dist = np.where(use_up_control, dist_up_m, dist_dn_m)
+                    nearest_z = np.where(use_up_control, z_exact_up, z_exact_dn)
+                    control_mask = use_up_control | use_dn_control
+                    if np.any(control_mask):
+                        x = np.clip(
+                            (
+                                nearest_dist[control_mask]
+                                - exact_cross_section_control_hold
+                            )
+                            / max(
+                                exact_cross_section_control_end_distance
+                                - exact_cross_section_control_hold,
+                                1e-6,
+                            ),
+                            0.0,
+                            1.0,
+                        )
+                        smoothstep = x * x * (3.0 - 2.0 * x)
+                        exact_weight = 1.0 - smoothstep
+                        interpolated_z[control_mask] = (
+                            (1.0 - exact_weight) * interpolated_z[control_mask]
+                            + exact_weight * nearest_z[control_mask]
+                        )
 
             new_zs[mask] = interpolated_z
 
+        _print_percent(progress_task, 82, "interpolated station-pair elevations")
         # Apply final continuous mathematical blending
         final_zs = w1_terrain * dtm_zs + w2_cs * new_zs
         outside_bank_polygon_mask = bank_mask[valid_rows, valid_cols] == 0
@@ -434,8 +522,10 @@ class InterpolationMixin:
             & (dtm_zs > final_zs)
         )
         final_zs[terrain_preserve_mask] = dtm_zs[terrain_preserve_mask]
+        _print_percent(progress_task, 90, "applied final blending")
 
         if break_after_first:
+            _print_percent(progress_task, 100, "sample cell complete")
             return [{
                 "row": int(valid_rows[0]), "col": int(valid_cols[0]),
                 "x": round(xs[0], 3), "y": round(ys[0], 3), "dtm_z": round(dtm_zs[0], 3),
@@ -463,9 +553,11 @@ class InterpolationMixin:
         modifier.interpolation_mask = interpolation_mask
         
         if not return_dicts:
+            _print_percent(progress_task, 100, "raster update complete")
             return None, modifier
             
         results = []
+        result_progress = None
         for i in range(N):
             results.append({
                 "row": int(valid_rows[i]), "col": int(valid_cols[i]),
@@ -481,10 +573,16 @@ class InterpolationMixin:
                 "new_interpolated_z": round(new_zs[i], 3),
                 "final_blended_z": round(final_zs[i], 3)
             })
+            result_progress = _print_loop_progress(
+                "Result table build progress",
+                i + 1,
+                N,
+                result_progress,
+            )
 
+        _print_percent(progress_task, 100, "complete")
         return results, modifier
 
-    @staticmethod
     def _profile_lower_envelope_z(
         z_func,
         corrected_distance,
@@ -699,7 +797,13 @@ class InterpolationMixin:
         if merged_banks_output_path is not None and not has_junctions:
             merged_banks_path = Path(merged_banks_output_path)
             merged_banks_path.parent.mkdir(parents=True, exist_ok=True)
-            network["merged_banks_gdf"].to_file(merged_banks_path)
+            merged_offset_banks = DTMChannelModifier.offset_bank_lines_outwards(
+                network["merged_banks_gdf"],
+                offset_m=bank_offset_m,
+            )
+            merged_offset_banks["OffsetM"] = float(bank_offset_m)
+            merged_offset_banks["Source"] = "merged_offset_bank_lines"
+            merged_offset_banks.to_file(merged_banks_path)
         elif merged_banks_output_path is not None and has_junctions:
             DTMChannelModifier._delete_vector_sidecars(merged_banks_output_path)
 
@@ -761,6 +865,18 @@ class InterpolationMixin:
                     "processing_centerline_source": channel.get("processing_centerline_source", "bank_lines"),
                     "endpoint_extrapolation_cells_skipped": int(
                         getattr(modifiers[index], "endpoint_extrapolation_cells_skipped", 0)
+                    ),
+                    "endpoint_terminal_apron_cells_included": int(
+                        getattr(modifiers[index], "endpoint_terminal_apron_cells_included", 0)
+                    ),
+                    "endpoint_upstream_apron_cells_included": int(
+                        getattr(modifiers[index], "endpoint_upstream_apron_cells_included", 0)
+                    ),
+                    "endpoint_downstream_apron_cells_included": int(
+                        getattr(modifiers[index], "endpoint_downstream_apron_cells_included", 0)
+                    ),
+                    "in_bank_cells_added_to_interpolation_mask": int(
+                        getattr(modifiers[index], "in_bank_cells_added_to_interpolation_mask", 0)
                     ),
                 }
                 for index, channel in enumerate(network["channels"])
@@ -1677,7 +1793,20 @@ class InterpolationMixin:
             )
         if not polygons:
             return None
-        footprint = unary_union(polygons)
+        repaired_polygons = []
+        for polygon in polygons:
+            if polygon is None or polygon.is_empty:
+                continue
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if polygon is not None and not polygon.is_empty:
+                repaired_polygons.append(polygon)
+        if not repaired_polygons:
+            return None
+        try:
+            footprint = unary_union(repaired_polygons)
+        except Exception:
+            footprint = unary_union([polygon.buffer(0) for polygon in repaired_polygons])
         if not footprint.is_valid:
             footprint = footprint.buffer(0)
         return footprint
@@ -1734,7 +1863,20 @@ class InterpolationMixin:
 
         if not polygons:
             return None
-        footprint = unary_union(polygons)
+        repaired_polygons = []
+        for polygon in polygons:
+            if polygon is None or polygon.is_empty:
+                continue
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if polygon is not None and not polygon.is_empty:
+                repaired_polygons.append(polygon)
+        if not repaired_polygons:
+            return None
+        try:
+            footprint = unary_union(repaired_polygons)
+        except Exception:
+            footprint = unary_union([polygon.buffer(0) for polygon in repaired_polygons])
         if not footprint.is_valid:
             footprint = footprint.buffer(0)
         return footprint if footprint is not None and not footprint.is_empty else None

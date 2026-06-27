@@ -107,7 +107,7 @@ def prepare_component_terrain_hdf(
     projection_prj_path: str | Path,
     exact_bank_polygon_path: str | Path | Iterable[str | Path] | None = None,
     units: str = "Meters",
-    hecras_version: str = "7.0",
+    hecras_version: str = "6.5",
     resampling: str = "bilinear",
     exact_bank_buffer_m: float = 2.0,
     channel_terrain_resolution_m: float = 0.1,

@@ -24,6 +24,19 @@ from shapely.ops import linemerge, nearest_points, split, unary_union
 DTMChannelModifier = None
 
 
+def _print_progress(task, current, total, last_percent=None, every_percent=1):
+    if total <= 0:
+        return last_percent
+    percent = int((float(current) / float(total)) * 100)
+    percent = max(0, min(100, percent))
+    if last_percent is None or percent >= last_percent + every_percent or percent >= 100:
+        print(f"\r{task}: {percent:3d}%", end="", flush=True)
+        if percent >= 100:
+            print()
+        return percent
+    return last_percent
+
+
 class BankVectorMixin:
     """Bank-line cleaning, centerline generation, masks, and vector convenience exports."""
 
@@ -60,6 +73,10 @@ class BankVectorMixin:
             gdf = gpd.read_file(banks_input)
         else:
             gdf = banks_input.copy()
+
+        gdf = gdf[gdf.geometry.notna()].copy()
+        if not gdf.empty:
+            gdf = gdf[~gdf.geometry.is_empty].copy()
             
         lines = []
         for geom in gdf.geometry:
@@ -82,6 +99,10 @@ class BankVectorMixin:
             dot = v1[0]*v2[0] + v1[1]*v2[1]
             dot = max(-1.0, min(1.0, dot))
             return math.degrees(math.acos(dot))
+
+        def _coords(line):
+            arr = np.asarray(line.coords)
+            return [tuple(point[:2]) for point in arr]
             
         def merge_pass(current_lines, tolerance, use_angles=False):
             while len(current_lines) > 2:
@@ -91,8 +112,10 @@ class BankVectorMixin:
                 
                 for i in range(len(current_lines)):
                     for j in range(i+1, len(current_lines)):
-                        c1 = list(current_lines[i].coords)
-                        c2 = list(current_lines[j].coords)
+                        c1 = _coords(current_lines[i])
+                        c2 = _coords(current_lines[j])
+                        if len(c1) < 2 or len(c2) < 2:
+                            continue
                         
                         d_ss = Point(c1[0]).distance(Point(c2[0]))
                         d_se = Point(c1[0]).distance(Point(c2[-1]))
@@ -140,8 +163,10 @@ class BankVectorMixin:
 
                 if best_pair:
                     i, j = best_pair
-                    c1 = list(current_lines[i].coords)
-                    c2 = list(current_lines[j].coords)
+                    c1 = _coords(current_lines[i])
+                    c2 = _coords(current_lines[j])
+                    if len(c1) < 2 or len(c2) < 2:
+                        break
                     
                     if best_mode == 'ss': new_coords = c1[::-1] + c2
                     elif best_mode == 'se': new_coords = c2 + c1
@@ -175,8 +200,10 @@ class BankVectorMixin:
                 
                 for i in range(len(fragments)):
                     for j in range(i+1, len(fragments)):
-                        c1 = list(fragments[i].coords)
-                        c2 = list(fragments[j].coords)
+                        c1 = _coords(fragments[i])
+                        c2 = _coords(fragments[j])
+                        if len(c1) < 2 or len(c2) < 2:
+                            continue
                         dists = [
                             (Point(c1[0]).distance(Point(c2[0])), 'ss'),
                             (Point(c1[0]).distance(Point(c2[-1])), 'se'),
@@ -191,8 +218,10 @@ class BankVectorMixin:
                 
                 if best_pair:
                     i, j = best_pair
-                    c1 = list(fragments[i].coords)
-                    c2 = list(fragments[j].coords)
+                    c1 = _coords(fragments[i])
+                    c2 = _coords(fragments[j])
+                    if len(c1) < 2 or len(c2) < 2:
+                        break
                     
                     sample_pts = c1[::max(1, len(c1)//20)] + c2[::max(1, len(c2)//20)]
                     med_width = np.median([dist_to_main(pt) for pt in sample_pts])
@@ -752,6 +781,8 @@ class BankVectorMixin:
 
         num_points = max(int(working_length / step_m), 2)
         center_coords = []
+        progress_task = "Centerline generation progress"
+        last_progress = _print_progress(progress_task, 0, num_points)
 
         for i in range(num_points + 1):
             p_a = line1.interpolate(start_dist + (i / num_points) * working_length)
@@ -784,6 +815,12 @@ class BankVectorMixin:
                 center_coords.append((p_eq.x, p_eq.y, z_avg))
             else:
                 center_coords.append((p_eq.x, p_eq.y))
+            last_progress = _print_progress(
+                progress_task,
+                i + 1,
+                num_points + 1,
+                last_progress,
+            )
 
         filtered_coords = [center_coords[0]]
         for coord in center_coords[1:]:
