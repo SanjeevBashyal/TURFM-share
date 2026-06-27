@@ -1,0 +1,1 @@
+numpy pandas rasterio geopandas scipy shapely matplotlib pyogrio pywin32 comtypes h5py pyshp ras_commander
