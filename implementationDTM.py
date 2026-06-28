@@ -7,15 +7,15 @@ from Automation.DTM import DTM
 
 
 CONFIG_SOURCE = "folder"
-MASTER_PROJECT_PATH = r"D:\TUR_FM\Nepal_Organize\3.Packages\20260415\4_Recieved Data\Cycle-1\Group-3"
+MASTER_PROJECT_PATH = r"C:\Users\Ripple\Desktop\1 Demonstrations\Project-Template"
 
 # PROJECTS_TO_RUN: list[str] | None = None
 # PROJECTS_TO_RUN = ["BUYUKGOKCELI"]
 # PROJECTS_TO_RUN = ["ARDICLI", "CIGRI", "CUKUROREN", "CUKUROREN-T"]
 # PROJECTS_TO_RUN = ["ECE2", "EVCILER1", "KILCAN"]
-PROJECTS_TO_RUN = ["AKARCA"]
+PROJECTS_TO_RUN = ["KAGILCIK"]
 
-TARGET_RES = 0.1
+TARGET_RES = 0.2
 BUFFER_M = 20
 BLEND_TYPE = "cubic"
 BANK_OFFSET_M = 0.2

@@ -459,24 +459,41 @@ class ExportMixin:
         output_dir,
         clip_buffer_m=5.0,
         nearest_cross_section_count=2,
+        combined_prefix=None,
     ):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         products = []
-
+        all_clipped_bank_gdfs = []
+        all_junction_polygon_rows = []
+        all_inner_polygon_rows = []
+        combined_crs = None
+        safe_combined_prefix = DTMChannelModifier._safe_name(combined_prefix or "network")
+        pair_counts = {}
         for junction in network.get("junctions", []):
             main = network["channels"][junction["main_index"]]
             tributary = network["channels"][junction["tributary_index"]]
+            pair_key = (str(tributary["name"]), str(main["name"]))
+            pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
+
+        for junction_index, junction in enumerate(network.get("junctions", []), start=1):
+            main = network["channels"][junction["main_index"]]
+            tributary = network["channels"][junction["tributary_index"]]
+            junction_id = str(junction.get("id") or f"J{junction_index:03d}")
             safe_pair_name = (
                 f"{DTMChannelModifier._safe_name(tributary['name'])}"
                 f"__{DTMChannelModifier._safe_name(main['name'])}"
             )
+            pair_key = (str(tributary["name"]), str(main["name"]))
+            safe_junction_name = safe_pair_name
+            if pair_counts.get(pair_key, 0) > 1:
+                safe_junction_name = f"{safe_pair_name}_{DTMChannelModifier._safe_name(junction_id)}"
             junction_point = Point(float(junction["x"]), float(junction["y"]))
             merged_banks = DTMChannelModifier.build_connected_junction_banklines(
                 channels=[tributary, main],
             )
 
-            merged_path = output_dir / f"{safe_pair_name}_SEV_USTU_combined.shp"
+            merged_path = output_dir / f"{safe_junction_name}_SEV_USTU_combined.shp"
             merged_path = DTMChannelModifier._write_gdf_with_locked_file_fallback(
                 merged_banks,
                 merged_path,
@@ -492,7 +509,19 @@ class ExportMixin:
                 clipped_banks,
                 tolerance=1.0,
             )
-            clipped_path = output_dir / f"{safe_pair_name}_SEV_USTU_junction_clipped.shp"
+            if combined_crs is None and clipped_banks is not None:
+                combined_crs = clipped_banks.crs
+            clipped_banks = DTMChannelModifier._with_junction_export_fields(
+                clipped_banks,
+                junction=junction,
+                junction_id=junction_id,
+                main=main,
+                tributary=tributary,
+            )
+            if clipped_banks is not None and not clipped_banks.empty:
+                all_clipped_bank_gdfs.append(clipped_banks.copy())
+
+            clipped_path = output_dir / f"{safe_junction_name}_SEV_USTU_junction_clipped.shp"
             clipped_path = DTMChannelModifier._write_gdf_with_locked_file_fallback(
                 clipped_banks,
                 clipped_path,
@@ -509,6 +538,8 @@ class ExportMixin:
                     polygon_gdf = gpd.GeoDataFrame(
                         [
                             {
+                                "JunctionId": junction_id[:80],
+                                "JuncRow": junction.get("network_row_index"),
                                 "main": str(main["name"])[:80],
                                 "tributary": str(tributary["name"])[:80],
                                 "geometry": junction_polygon,
@@ -517,7 +548,8 @@ class ExportMixin:
                         geometry="geometry",
                         crs=clipped_banks.crs,
                     )
-                    junction_polygon_path = output_dir / f"{safe_pair_name}_SEV_USTU_junction_bank_polygon.shp"
+                    all_junction_polygon_rows.extend(polygon_gdf.to_dict("records"))
+                    junction_polygon_path = output_dir / f"{safe_junction_name}_SEV_USTU_junction_bank_polygon.shp"
                     junction_polygon_path = DTMChannelModifier._write_gdf_with_locked_file_fallback(
                         polygon_gdf,
                         junction_polygon_path,
@@ -531,6 +563,8 @@ class ExportMixin:
                         inner_polygon_gdf = gpd.GeoDataFrame(
                             [
                                 {
+                                    "JunctionId": junction_id[:80],
+                                    "JuncRow": junction.get("network_row_index"),
                                     "main": str(main["name"])[:80],
                                     "tributary": str(tributary["name"])[:80],
                                     "offset_m": 0.3,
@@ -540,7 +574,8 @@ class ExportMixin:
                             geometry="geometry",
                             crs=clipped_banks.crs,
                         )
-                        junction_inner_polygon_path = output_dir / f"{safe_pair_name}_SEV_USTU_junction_inner_0p3m_polygon.shp"
+                        all_inner_polygon_rows.extend(inner_polygon_gdf.to_dict("records"))
+                        junction_inner_polygon_path = output_dir / f"{safe_junction_name}_SEV_USTU_junction_inner_0p3m_polygon.shp"
                         junction_inner_polygon_path = DTMChannelModifier._write_gdf_with_locked_file_fallback(
                             inner_polygon_gdf,
                             junction_inner_polygon_path,
@@ -550,6 +585,9 @@ class ExportMixin:
 
             products.append(
                 {
+                    "type": "junction",
+                    "junction_id": junction_id,
+                    "network_row_index": junction.get("network_row_index"),
                     "main": main["name"],
                     "tributary": tributary["name"],
                     "merged_banks_shp": str(merged_path),
@@ -559,7 +597,99 @@ class ExportMixin:
                 }
             )
 
+        combined_product = DTMChannelModifier._write_combined_junction_products(
+            output_dir=output_dir,
+            safe_prefix=safe_combined_prefix,
+            clipped_bank_gdfs=all_clipped_bank_gdfs,
+            junction_polygon_rows=all_junction_polygon_rows,
+            inner_polygon_rows=all_inner_polygon_rows,
+            crs=combined_crs,
+        )
+        if combined_product:
+            products.append(combined_product)
+
         return products
+
+    @staticmethod
+    def _with_junction_export_fields(gdf, junction, junction_id, main, tributary):
+        if gdf is None or gdf.empty:
+            return gdf
+
+        export_gdf = gdf.copy()
+        export_gdf["JunctionId"] = str(junction_id)[:80]
+        export_gdf["JuncRow"] = junction.get("network_row_index")
+        export_gdf["Main"] = str(main["name"])[:80]
+        export_gdf["Tributary"] = str(tributary["name"])[:80]
+        export_gdf["From"] = str(junction.get("from") or tributary["name"])[:80]
+        export_gdf["To"] = str(junction.get("to") or main["name"])[:80]
+        return export_gdf
+
+    @staticmethod
+    def _write_combined_junction_products(
+        output_dir,
+        safe_prefix,
+        clipped_bank_gdfs,
+        junction_polygon_rows,
+        inner_polygon_rows,
+        crs=None,
+    ):
+        combined_product = {
+            "type": "all_junctions",
+            "junction_count": len(junction_polygon_rows),
+            "junction_clipped_banks_shp": None,
+            "junction_bank_polygon_shp": None,
+            "junction_inner_bed_polygon_shp": None,
+        }
+
+        if clipped_bank_gdfs:
+            combined_clipped = gpd.GeoDataFrame(
+                pd.concat(clipped_bank_gdfs, ignore_index=True),
+                geometry="geometry",
+                crs=clipped_bank_gdfs[0].crs,
+            )
+            combined_clipped_path = output_dir / f"{safe_prefix}_SEV_USTU_all_junction_clipped.shp"
+            combined_clipped_path = DTMChannelModifier._write_gdf_with_locked_file_fallback(
+                combined_clipped,
+                combined_clipped_path,
+            )
+            combined_product["junction_clipped_banks_shp"] = str(combined_clipped_path)
+
+        if junction_polygon_rows:
+            polygon_gdf = gpd.GeoDataFrame(
+                junction_polygon_rows,
+                geometry="geometry",
+                crs=crs,
+            )
+            polygon_path = output_dir / f"{safe_prefix}_SEV_USTU_all_junction_bank_polygons.shp"
+            polygon_path = DTMChannelModifier._write_gdf_with_locked_file_fallback(
+                polygon_gdf,
+                polygon_path,
+            )
+            combined_product["junction_bank_polygon_shp"] = str(polygon_path)
+
+        if inner_polygon_rows:
+            inner_gdf = gpd.GeoDataFrame(
+                inner_polygon_rows,
+                geometry="geometry",
+                crs=crs,
+            )
+            inner_path = output_dir / f"{safe_prefix}_SEV_USTU_all_junction_inner_0p3m_polygons.shp"
+            inner_path = DTMChannelModifier._write_gdf_with_locked_file_fallback(
+                inner_gdf,
+                inner_path,
+            )
+            combined_product["junction_inner_bed_polygon_shp"] = str(inner_path)
+
+        if not any(
+            combined_product[key]
+            for key in (
+                "junction_clipped_banks_shp",
+                "junction_bank_polygon_shp",
+                "junction_inner_bed_polygon_shp",
+            )
+        ):
+            return None
+        return combined_product
 
     @staticmethod
     def build_connected_junction_banklines(channels, proximity_tolerance=1.0):

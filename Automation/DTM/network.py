@@ -195,7 +195,6 @@ class NetworkMixin:
         centerline_gap_m=0.5,
     ):
         junctions = []
-        seen_pairs = set()
 
         for connection in network_connections:
             tributary = DTMChannelModifier._find_channel_by_network_name(
@@ -211,17 +210,28 @@ class NetworkMixin:
             if tributary["index"] == main["index"]:
                 continue
 
-            pair_key = (tributary["index"], main["index"])
-            if pair_key in seen_pairs:
-                continue
-            seen_pairs.add(pair_key)
-
+            network_point = DTMChannelModifier._network_connection_point(connection)
             best = DTMChannelModifier._endpoint_to_centerline_candidate(
                 tributary=tributary,
                 main=main,
+                target_point=network_point,
             )
             if best is None:
                 continue
+
+            junction_point = best["junction_point"]
+            main_fraction = best["main_fraction"]
+            network_point_to_main_distance = None
+            if network_point is not None:
+                main_distance = main["centerline"].project(network_point)
+                main_fraction = main_distance / main["centerline"].length if main["centerline"].length else 0.0
+                junction_point_on_main = main["centerline"].interpolate(main_distance)
+                network_point_to_main_distance = network_point.distance(junction_point_on_main)
+                # Keep the authored junction coordinate when present.  The rest
+                # of the interpolation projects it to the main centerline when a
+                # chainage is needed, so slightly off-line surveyed coordinates
+                # remain usable without collapsing several network rows together.
+                junction_point = network_point
 
             if best["distance"] > junction_tolerance:
                 print(
@@ -229,6 +239,16 @@ class NetworkMixin:
                     f"{tributary['name']} -> {main['name']} is "
                     f"{best['distance']:.2f}m from the main centerline "
                     f"(tolerance {junction_tolerance:.2f}m). Extending by network rule."
+                )
+            if (
+                network_point_to_main_distance is not None
+                and network_point_to_main_distance > junction_tolerance
+            ):
+                print(
+                    "Warning: network.csv coordinate for junction "
+                    f"{tributary['name']} -> {main['name']} is "
+                    f"{network_point_to_main_distance:.2f}m from the main centerline "
+                    f"(tolerance {junction_tolerance:.2f}m)."
                 )
 
             extended_centerline = DTMChannelModifier._extend_line_endpoint_along_tangent_to_line(
@@ -238,24 +258,37 @@ class NetworkMixin:
                 gap_m=centerline_gap_m,
             )
 
+            row_index = connection.get("row_index")
+            junction_id = connection.get("id") or (
+                f"J{int(row_index):03d}" if row_index is not None else f"J{len(junctions) + 1:03d}"
+            )
             junctions.append(
                 {
+                    "id": junction_id,
                     "main": main["name"],
                     "tributary": tributary["name"],
                     "main_index": main["index"],
                     "tributary_index": tributary["index"],
                     "tributary_endpoint": best["tributary_endpoint"],
                     "distance": round(float(best["distance"]), 3),
-                    "x": float(best["junction_point"].x),
-                    "y": float(best["junction_point"].y),
-                    "main_fraction": round(float(best["main_fraction"]), 4),
+                    "x": float(junction_point.x),
+                    "y": float(junction_point.y),
+                    "main_fraction": round(float(main_fraction), 4),
                     "source": "network.csv",
                     "from": connection["from"],
                     "to": connection["to"],
+                    "network_row_index": row_index,
                     "centerline_gap_m": float(centerline_gap_m),
                     "extended_centerline": extended_centerline,
                 }
             )
+            if network_point_to_main_distance is not None:
+                junctions[-1]["network_point_to_main_distance"] = round(
+                    float(network_point_to_main_distance),
+                    3,
+                )
+            if connection.get("elevation") is not None:
+                junctions[-1]["network_elevation"] = float(connection["elevation"])
 
         return junctions
 
@@ -275,15 +308,100 @@ class NetworkMixin:
         normalized_columns = {str(column).strip().casefold(): column for column in df.columns}
         from_column = normalized_columns.get("from") or df.columns[0]
         to_column = normalized_columns.get("to") or df.columns[1]
+        easting_column = DTMChannelModifier._network_column(
+            normalized_columns,
+            "easting",
+            "east",
+            "x",
+        )
+        northing_column = DTMChannelModifier._network_column(
+            normalized_columns,
+            "northing",
+            "north",
+            "y",
+        )
+        elevation_column = DTMChannelModifier._network_column(
+            normalized_columns,
+            "elevation",
+            "elev",
+            "z",
+        )
+        id_column = DTMChannelModifier._network_column(
+            normalized_columns,
+            "id",
+            "junction",
+            "junctionid",
+            "junction_id",
+        )
 
         connections = []
-        for _, row in df.iterrows():
+        for row_index, (_, row) in enumerate(df.iterrows(), start=1):
             from_name = str(row[from_column]).strip()
             to_name = str(row[to_column]).strip()
             if not from_name or not to_name or from_name.lower() == "nan" or to_name.lower() == "nan":
                 continue
-            connections.append({"from": from_name, "to": to_name})
+            connection = {
+                "from": from_name,
+                "to": to_name,
+                "row_index": row_index,
+            }
+            easting = DTMChannelModifier._network_optional_float(row.get(easting_column)) if easting_column else None
+            northing = DTMChannelModifier._network_optional_float(row.get(northing_column)) if northing_column else None
+            elevation = DTMChannelModifier._network_optional_float(row.get(elevation_column)) if elevation_column else None
+            if easting is not None and northing is not None:
+                connection["easting"] = easting
+                connection["northing"] = northing
+            if elevation is not None:
+                connection["elevation"] = elevation
+            if id_column:
+                junction_id = str(row.get(id_column, "")).strip()
+                if junction_id and junction_id.lower() != "nan":
+                    connection["id"] = junction_id
+            connections.append(connection)
         return connections
+
+    @staticmethod
+    def _network_column(normalized_columns, *names):
+        for name in names:
+            column = normalized_columns.get(str(name).strip().casefold())
+            if column is not None:
+                return column
+        return None
+
+    @staticmethod
+    def _network_optional_float(value):
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        text = str(value).strip()
+        if not text or text.lower() == "nan":
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            try:
+                return float(text.replace(",", "."))
+            except ValueError:
+                return None
+
+    @staticmethod
+    def _network_connection_point(connection):
+        easting = connection.get("easting")
+        northing = connection.get("northing")
+        if easting is None or northing is None:
+            return None
+        try:
+            easting = float(easting)
+            northing = float(northing)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(easting) or not np.isfinite(northing):
+            return None
+        return Point(easting, northing)
 
     @staticmethod
     def update_network_junction_coordinates(network_csv_path, junctions, dtm_path):
@@ -332,13 +450,18 @@ class NetworkMixin:
             junction["northing"] = y
             junction["elevation"] = elevation
 
-            mask = df.apply(
-                lambda row: (
-                    DTMChannelModifier._network_names_match(row.get("From", ""), from_name)
-                    and DTMChannelModifier._network_names_match(row.get("To", ""), to_name)
-                ),
-                axis=1,
-            )
+            row_index = junction.get("network_row_index")
+            if row_index is not None and 1 <= int(row_index) <= len(df):
+                target_index = df.index[int(row_index) - 1]
+                mask = df.index == target_index
+            else:
+                mask = df.apply(
+                    lambda row: (
+                        DTMChannelModifier._network_names_match(row.get("From", ""), from_name)
+                        and DTMChannelModifier._network_names_match(row.get("To", ""), to_name)
+                    ),
+                    axis=1,
+                )
             if not mask.any():
                 mask = df.apply(
                     lambda row: (
@@ -468,7 +591,7 @@ class NetworkMixin:
         return vector / norm
 
     @staticmethod
-    def _endpoint_to_centerline_candidate(tributary, main):
+    def _endpoint_to_centerline_candidate(tributary, main, target_point=None):
         tributary_line = tributary["centerline"]
         main_line = main["centerline"]
         if tributary_line.length <= 0 or main_line.length <= 0:
@@ -482,6 +605,7 @@ class NetworkMixin:
             main_fraction = main_distance / main_line.length if main_line.length else 0.0
             junction_point = main_line.interpolate(main_distance)
             distance = endpoint.distance(junction_point)
+            selection_distance = endpoint.distance(target_point) if target_point is not None else distance
             is_mid_reach = 0.05 <= main_fraction <= 0.95
             candidate = {
                 "tributary_index": tributary["index"],
@@ -492,9 +616,10 @@ class NetworkMixin:
                 "junction_point": junction_point,
                 "main_fraction": main_fraction,
                 "distance": distance,
+                "selection_distance": selection_distance,
                 "is_mid_reach": is_mid_reach,
             }
-            if best is None or candidate["distance"] < best["distance"]:
+            if best is None or candidate["selection_distance"] < best["selection_distance"]:
                 best = candidate
 
         return best

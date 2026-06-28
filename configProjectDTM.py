@@ -8,9 +8,9 @@ from pathlib import Path
 
 
 DIRECT_RUN_SOURCE = "folder"
-DIRECT_RUN_MASTER_PROJECT_PATH = Path(r"E:\TUR_FM\Nepal_Organize\3.Packages\20260415\4_Recieved Data\Cycle-1\Group-3copy")
+DIRECT_RUN_MASTER_PROJECT_PATH = Path(r"C:\Users\Ripple\Desktop\1 Demonstrations\Project-Template")
 DIRECT_RUN_PREPARE_FULL_STRUCTURE = False
-BUR_INPUT_DIRNAME = "1 Bur"
+BUR_INPUT_DIRNAME = "1 Bur-Bur"
 LEGACY_BUR_INPUT_DIRNAME = "1 Bur-Bur"
 
 

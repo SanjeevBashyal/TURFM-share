@@ -824,11 +824,17 @@ class InterpolationMixin:
             else output_tif_path.parent
         )
         if has_junctions:
+            combined_junction_prefix = DTMChannelModifier._safe_name(output_tif_path.stem)
+            for suffix in ("_junction_channel_terrain", "_channel_terrain"):
+                if combined_junction_prefix.endswith(suffix):
+                    combined_junction_prefix = combined_junction_prefix[: -len(suffix)]
+                    break
             connected_bank_products = DTMChannelModifier._export_connected_bank_products(
                 network=network,
                 output_dir=connected_banks_dir,
                 clip_buffer_m=junction_bank_clip_buffer_m,
                 nearest_cross_section_count=junction_clip_cross_section_count,
+                combined_prefix=combined_junction_prefix,
             )
 
         return {
