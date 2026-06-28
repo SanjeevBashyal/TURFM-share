@@ -723,6 +723,15 @@ class InterpolationMixin:
 
         final_modifier = modifiers[0]
         original_dtm_data = getattr(final_modifier, "original_dtm_data", final_modifier.dtm_data)
+        reach_overlap_skipped_count = 0
+        if has_junctions:
+            reach_overlap_skipped_count = DTMChannelModifier._clear_reach_masks_inside_other_channel_banks(
+                modifiers=modifiers,
+                network=network,
+                transform=final_modifier.dtm_transform,
+                out_shape=final_modifier.dtm_data.shape,
+                bank_offset_m=bank_offset_m,
+            )
         junction_exclusion_mask = None
         if has_junctions and junction_half_section_interpolation:
             junction_exclusion_mask = DTMChannelModifier._junction_influence_mask(
@@ -855,6 +864,7 @@ class InterpolationMixin:
             "junction_half_section_interpolation": bool(junction_half_section_interpolation),
             "junction_bank_structure_protection_m": float(junction_bank_structure_protection_m),
             "outside_bank_terrain_preserved_cells": int(outside_bank_preserved_count),
+            "reach_overlap_cells_skipped": int(reach_overlap_skipped_count),
             "skewness_correction": bool(skewness_correction),
             "centerline_normal_sample_distance_m": float(centerline_normal_sample_distance_m),
             "building_lift": building_lift_summary,
@@ -883,6 +893,9 @@ class InterpolationMixin:
                     ),
                     "in_bank_cells_added_to_interpolation_mask": int(
                         getattr(modifiers[index], "in_bank_cells_added_to_interpolation_mask", 0)
+                    ),
+                    "reach_overlap_cells_skipped": int(
+                        getattr(modifiers[index], "reach_overlap_cells_skipped", 0)
                     ),
                 }
                 for index, channel in enumerate(network["channels"])
@@ -1960,6 +1973,207 @@ class InterpolationMixin:
             final[mask] = modifier.dtm_data[mask].astype("float32")
 
         return final
+
+    @staticmethod
+    def _clear_reach_masks_inside_other_channel_banks(
+        modifiers,
+        network,
+        transform,
+        out_shape,
+        bank_offset_m=0.2,
+    ):
+        """Keep reach transition strips from painting inside neighboring channels.
+
+        Junction polygons are intentionally excluded from this skip area because
+        the dedicated junction pass owns those cells.
+        """
+
+        channels = network.get("channels", [])
+        if len(channels) <= 1 or not modifiers:
+            return 0
+
+        for modifier in modifiers:
+            modifier.reach_overlap_cells_skipped = 0
+
+        channel_footprints = [
+            DTMChannelModifier._single_channel_bank_footprint(
+                channel,
+                bank_offset_m=bank_offset_m,
+            )
+            for channel in channels
+        ]
+        junction_polygons = DTMChannelModifier._junction_bank_polygon_geometries(network)
+        junction_union = None
+        if junction_polygons:
+            try:
+                junction_union = unary_union(junction_polygons)
+            except Exception:
+                junction_union = unary_union([polygon.buffer(0) for polygon in junction_polygons])
+            if junction_union is not None and not junction_union.is_empty and not junction_union.is_valid:
+                junction_union = junction_union.buffer(0)
+
+        total_skipped = 0
+        for index, modifier in enumerate(modifiers):
+            active_mask = getattr(modifier, "interpolation_mask", None)
+            if active_mask is None:
+                continue
+            active_mask = np.array(active_mask, dtype=bool, copy=True)
+            if not np.any(active_mask):
+                modifier.interpolation_mask = active_mask
+                continue
+
+            current_footprint = (
+                channel_footprints[index]
+                if index < len(channel_footprints)
+                else None
+            )
+            current_channel_bank_mask = np.zeros(out_shape, dtype=bool)
+            if current_footprint is not None and not current_footprint.is_empty:
+                current_channel_bank_mask = rasterize(
+                    [current_footprint],
+                    out_shape=out_shape,
+                    transform=transform,
+                    fill=0,
+                    default_value=1,
+                    dtype="uint8",
+                    all_touched=False,
+                ).astype(bool)
+
+            other_footprints = [
+                footprint
+                for footprint_index, footprint in enumerate(channel_footprints)
+                if footprint_index != index and footprint is not None and not footprint.is_empty
+            ]
+            if not other_footprints:
+                modifier.interpolation_mask = active_mask
+                continue
+
+            try:
+                overlap_geometry = unary_union(other_footprints)
+            except Exception:
+                overlap_geometry = unary_union([footprint.buffer(0) for footprint in other_footprints])
+            if overlap_geometry is None or overlap_geometry.is_empty:
+                modifier.interpolation_mask = active_mask
+                continue
+            if not overlap_geometry.is_valid:
+                overlap_geometry = overlap_geometry.buffer(0)
+
+            if junction_union is not None and not junction_union.is_empty:
+                overlap_geometry = overlap_geometry.difference(junction_union)
+                if overlap_geometry is not None and not overlap_geometry.is_empty and not overlap_geometry.is_valid:
+                    overlap_geometry = overlap_geometry.buffer(0)
+            if overlap_geometry is None or overlap_geometry.is_empty:
+                modifier.interpolation_mask = active_mask
+                continue
+
+            other_channel_bank_mask = rasterize(
+                [overlap_geometry],
+                out_shape=out_shape,
+                transform=transform,
+                fill=0,
+                default_value=1,
+                dtype="uint8",
+                all_touched=False,
+            ).astype(bool)
+            skip_mask = active_mask & other_channel_bank_mask & ~current_channel_bank_mask
+            skipped_count = int(np.count_nonzero(skip_mask))
+            if skipped_count:
+                active_mask[skip_mask] = False
+                original = getattr(modifier, "original_dtm_data", None)
+                if original is not None and np.shape(original) == np.shape(modifier.dtm_data):
+                    modifier.dtm_data[skip_mask] = np.asarray(original)[skip_mask]
+                modifier.reach_overlap_cells_skipped = skipped_count
+                total_skipped += skipped_count
+
+            modifier.interpolation_mask = active_mask
+
+        if total_skipped:
+            print(
+                "Skipped "
+                f"{total_skipped} outside-bank reach interpolation cell(s) "
+                "that fell inside another channel bank polygon outside "
+                "junction polygons."
+            )
+        return total_skipped
+
+    @staticmethod
+    def _single_channel_bank_footprint(channel, bank_offset_m=0.2):
+        banks_gdf = channel.get("processing_banks_gdf")
+        if banks_gdf is None:
+            banks_gdf = channel.get("banks_gdf")
+        if banks_gdf is None or banks_gdf.empty:
+            return None
+
+        try:
+            polygon_gdf = DTMChannelModifier.create_polygon_mask_from_banks(
+                banks_gdf,
+                offset_m=bank_offset_m,
+            )
+        except Exception:
+            polygon_gdf = DTMChannelModifier.create_polygon_mask_from_banks(
+                banks_gdf,
+                offset_m=0.0,
+            )
+        polygons = [
+            polygon
+            for polygon in polygon_gdf.geometry
+            if polygon is not None and not polygon.is_empty
+        ]
+        if not polygons:
+            return None
+
+        repaired = []
+        for polygon in polygons:
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if polygon is not None and not polygon.is_empty:
+                repaired.append(polygon)
+        if not repaired:
+            return None
+
+        try:
+            footprint = unary_union(repaired)
+        except Exception:
+            footprint = unary_union([polygon.buffer(0) for polygon in repaired])
+        if footprint is not None and not footprint.is_empty and not footprint.is_valid:
+            footprint = footprint.buffer(0)
+        return footprint if footprint is not None and not footprint.is_empty else None
+
+    @staticmethod
+    def _junction_bank_polygon_geometries(network):
+        polygons = []
+        for junction in network.get("junctions", []):
+            try:
+                main = network["channels"][junction["main_index"]]
+                tributary = network["channels"][junction["tributary_index"]]
+                junction_point = Point(float(junction["x"]), float(junction["y"]))
+                clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
+                    tributary=tributary,
+                    main=main,
+                    junction=junction,
+                    junction_point=junction_point,
+                )
+                clipped_banks = DTMChannelModifier._join_gdf_line_features_by_proximity(
+                    clipped_banks,
+                    tolerance=1.0,
+                )
+                bank_lines = DTMChannelModifier._line_strings(clipped_banks)
+                polygon = DTMChannelModifier._junction_bank_polygon_from_clipped_banks(
+                    clipped_banks,
+                    bank_lines=bank_lines,
+                    junction_point=junction_point,
+                )
+            except Exception as exc:
+                print(f"Warning: could not build junction overlap exclusion polygon: {exc}")
+                continue
+
+            if polygon is None or polygon.is_empty:
+                continue
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if polygon is not None and not polygon.is_empty:
+                polygons.append(polygon)
+        return polygons
 
     @staticmethod
     def _junction_influence_mask(
