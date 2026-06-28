@@ -948,14 +948,14 @@ class InterpolationMixin:
                 skewness_correction=skewness_correction,
                 centerline_normal_sample_distance_m=centerline_normal_sample_distance_m,
             )
-            clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
+            raw_clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
                 tributary=tributary,
                 main=main,
                 junction=junction,
                 junction_point=junction_point,
             )
             clipped_banks = DTMChannelModifier._join_gdf_line_features_by_proximity(
-                clipped_banks,
+                raw_clipped_banks,
                 tolerance=1.0,
             )
             bank_lines = DTMChannelModifier._line_strings(clipped_banks)
@@ -985,7 +985,7 @@ class InterpolationMixin:
                 bank_offset_m=bank_offset_m,
             )
             junction_bank_polygon = DTMChannelModifier._junction_bank_polygon_from_clipped_banks(
-                clipped_banks,
+                raw_clipped_banks,
                 bank_lines=bank_lines,
                 junction_point=junction_point,
             )
@@ -1524,34 +1524,27 @@ class InterpolationMixin:
         """Return the central junction bed area inside the inward bank offsets.
 
         The clipped junction polygon is the full hydraulic junction footprint.
-        The inner bed is that footprint after removing only the narrow strips
-        within `offset_m` of the clipped bank lines.  This follows the requested
-        "0.2 m inward offset from each bank line" logic while keeping all three
-        branch beds connected through one continuous central zone.
+        The inner bed is an inward offset of the junction footprint.  Internal
+        clipped bank lines are not subtracted because they can create artificial
+        raised dividers through the confluence.
         """
 
         if junction_bank_polygon is None or junction_bank_polygon.is_empty:
             return None
         offset = max(float(offset_m), 0.0)
-        if offset <= 1e-9 or not bank_lines:
+        if offset <= 1e-9:
             return junction_bank_polygon
 
-        bank_strips = [
-            line.buffer(offset, cap_style=2, join_style=2)
-            for line in bank_lines
-            if line is not None and not line.is_empty
-        ]
-        if not bank_strips:
+        inner_polygon = junction_bank_polygon.buffer(-offset, join_style=2)
+        if inner_polygon is None or inner_polygon.is_empty:
             return junction_bank_polygon
-
-        inner_polygon = junction_bank_polygon.difference(unary_union(bank_strips))
-        if inner_polygon is None or inner_polygon.is_empty:
-            inner_polygon = junction_bank_polygon.buffer(-offset, join_style=2)
-        if inner_polygon is None or inner_polygon.is_empty:
-            return None
         if not inner_polygon.is_valid:
             inner_polygon = inner_polygon.buffer(0)
-        return inner_polygon if inner_polygon is not None and not inner_polygon.is_empty else None
+        if inner_polygon is None or inner_polygon.is_empty:
+            return junction_bank_polygon
+        if inner_polygon.geom_type == "MultiPolygon" and len(inner_polygon.geoms) > 1:
+            return junction_bank_polygon
+        return inner_polygon
 
     @staticmethod
     def _junction_inner_bed_elevation(cell_point, bed_profiles, cell_size=0.1):
@@ -1595,6 +1588,9 @@ class InterpolationMixin:
 
         boundary_lines = [line for line in lines if line is not None and not line.is_empty]
         boundary_lines.extend(
+            DTMChannelModifier._junction_clipped_bank_boundary_connectors(clipped_banks)
+        )
+        boundary_lines.extend(
             DTMChannelModifier._junction_clipped_bank_endpoint_connectors(boundary_lines)
         )
 
@@ -1618,6 +1614,60 @@ class InterpolationMixin:
         if not polygon.is_valid:
             polygon = polygon.buffer(0)
         return polygon if polygon is not None and not polygon.is_empty else None
+
+    @staticmethod
+    def _junction_clipped_bank_boundary_connectors(clipped_banks):
+        if clipped_banks is None or getattr(clipped_banks, "empty", True):
+            return []
+        if "StartCut" not in clipped_banks.columns or "EndCut" not in clipped_banks.columns:
+            return []
+
+        grouped_endpoints = {}
+        for _, row in clipped_banks.iterrows():
+            line = row.geometry
+            if line is None or line.is_empty:
+                continue
+            coords = list(line.coords)
+            if len(coords) < 2:
+                continue
+            for column, coord in (("StartCut", coords[0]), ("EndCut", coords[-1])):
+                label = row.get(column)
+                if label is None or pd.isna(label):
+                    continue
+                label = str(label).strip()
+                if not label:
+                    continue
+                grouped_endpoints.setdefault(label, []).append(
+                    (Point(coord[:2]), coord)
+                )
+
+        connectors = []
+        for endpoints in grouped_endpoints.values():
+            unique = []
+            for point, coord in endpoints:
+                if all(point.distance(existing[0]) > 1e-6 for existing in unique):
+                    unique.append((point, coord))
+            if len(unique) < 2:
+                continue
+
+            best_pair = None
+            for first_index, first in enumerate(unique):
+                for second in unique[first_index + 1:]:
+                    distance = first[0].distance(second[0])
+                    if best_pair is None or distance > best_pair[0]:
+                        best_pair = (distance, first, second)
+            if best_pair is None or best_pair[0] <= 1e-6:
+                continue
+            _, first, second = best_pair
+            connectors.append(
+                LineString(
+                    [
+                        DTMChannelModifier._coord_like_point(first[0], first[1]),
+                        DTMChannelModifier._coord_like_point(second[0], second[1]),
+                    ]
+                )
+            )
+        return connectors
 
     @staticmethod
     def _junction_clipped_bank_endpoint_connectors(lines):
@@ -1861,19 +1911,19 @@ class InterpolationMixin:
             main = network["channels"][junction["main_index"]]
             tributary = network["channels"][junction["tributary_index"]]
             junction_point = Point(float(junction["x"]), float(junction["y"]))
-            clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
+            raw_clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
                 tributary=tributary,
                 main=main,
                 junction=junction,
                 junction_point=junction_point,
             )
             clipped_banks = DTMChannelModifier._join_gdf_line_features_by_proximity(
-                clipped_banks,
+                raw_clipped_banks,
                 tolerance=1.0,
             )
             bank_lines = DTMChannelModifier._line_strings(clipped_banks)
             junction_polygon = DTMChannelModifier._junction_bank_polygon_from_clipped_banks(
-                clipped_banks,
+                raw_clipped_banks,
                 bank_lines=bank_lines,
                 junction_point=junction_point,
             )
@@ -2147,19 +2197,19 @@ class InterpolationMixin:
                 main = network["channels"][junction["main_index"]]
                 tributary = network["channels"][junction["tributary_index"]]
                 junction_point = Point(float(junction["x"]), float(junction["y"]))
-                clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
+                raw_clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
                     tributary=tributary,
                     main=main,
                     junction=junction,
                     junction_point=junction_point,
                 )
                 clipped_banks = DTMChannelModifier._join_gdf_line_features_by_proximity(
-                    clipped_banks,
+                    raw_clipped_banks,
                     tolerance=1.0,
                 )
                 bank_lines = DTMChannelModifier._line_strings(clipped_banks)
                 polygon = DTMChannelModifier._junction_bank_polygon_from_clipped_banks(
-                    clipped_banks,
+                    raw_clipped_banks,
                     bank_lines=bank_lines,
                     junction_point=junction_point,
                 )
@@ -2205,14 +2255,14 @@ class InterpolationMixin:
                 skewness_correction=skewness_correction,
                 centerline_normal_sample_distance_m=centerline_normal_sample_distance_m,
             )
-            clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
+            raw_clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
                 tributary=tributary,
                 main=main,
                 junction=junction,
                 junction_point=junction_point,
             )
             clipped_banks = DTMChannelModifier._join_gdf_line_features_by_proximity(
-                clipped_banks,
+                raw_clipped_banks,
                 tolerance=1.0,
             )
             bank_lines = DTMChannelModifier._line_strings(clipped_banks)
@@ -2228,7 +2278,7 @@ class InterpolationMixin:
                 bank_offset_m=bank_offset_m,
             )
             junction_bank_polygon = DTMChannelModifier._junction_bank_polygon_from_clipped_banks(
-                clipped_banks,
+                raw_clipped_banks,
                 bank_lines=bank_lines,
                 junction_point=junction_point,
             )

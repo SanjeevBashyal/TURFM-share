@@ -135,24 +135,29 @@ class ExportMixin:
     def _delete_vector_sidecars(path):
         path = Path(path)
         if not path.parent.exists():
-            return
+            return True
+        deleted_all = True
         for sidecar in path.parent.glob(f"{path.stem}.*"):
             try:
                 sidecar.unlink()
             except OSError:
-                pass
+                deleted_all = False
+        return deleted_all
 
     @staticmethod
     def _write_gdf_with_locked_file_fallback(gdf, output_path):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            if not DTMChannelModifier._delete_vector_sidecars(output_path):
+                raise PermissionError(f"Could not replace locked vector sidecars for {output_path}")
             gdf.to_file(output_path)
             return output_path
         except PermissionError:
             for index in range(1, 100):
                 fallback = output_path.with_name(f"{output_path.stem}_new{index}{output_path.suffix}")
                 try:
+                    DTMChannelModifier._delete_vector_sidecars(fallback)
                     gdf.to_file(fallback)
                     print(
                         f"Warning: {output_path} is locked by another process; "
@@ -499,14 +504,14 @@ class ExportMixin:
                 merged_path,
             )
 
-            clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
+            raw_clipped_banks = DTMChannelModifier._junction_bank_lines_between_cross_sections(
                 tributary=tributary,
                 main=main,
                 junction=junction,
                 junction_point=junction_point,
             )
             clipped_banks = DTMChannelModifier._join_gdf_line_features_by_proximity(
-                clipped_banks,
+                raw_clipped_banks,
                 tolerance=1.0,
             )
             if combined_crs is None and clipped_banks is not None:
@@ -531,7 +536,8 @@ class ExportMixin:
             junction_inner_polygon_path = None
             try:
                 junction_polygon = DTMChannelModifier._junction_bank_polygon_from_clipped_banks(
-                    clipped_banks,
+                    raw_clipped_banks,
+                    bank_lines=DTMChannelModifier._line_strings(clipped_banks),
                     junction_point=junction_point,
                 )
                 if junction_polygon is not None and not junction_polygon.is_empty:
@@ -799,29 +805,47 @@ class ExportMixin:
         crs = main["banks_gdf"].crs or tributary["banks_gdf"].crs
         rows = []
 
-        main_range = DTMChannelModifier._main_junction_cross_section_range(
+        main_bounds = DTMChannelModifier._main_junction_cross_section_bounds(
             channel=main,
             junction_point=junction_point,
         )
-        tributary_range = DTMChannelModifier._tributary_junction_cross_section_range(
+        tributary_bounds = DTMChannelModifier._tributary_junction_cross_section_bounds(
             channel=tributary,
             endpoint_name=junction["tributary_endpoint"],
         )
 
-        for role, channel, measure_range in (
-            ("main", main, main_range),
-            ("tributary", tributary, tributary_range),
+        for role, channel, bounds in (
+            ("main", main, main_bounds),
+            ("tributary", tributary, tributary_bounds),
         ):
-            if measure_range is None:
+            if bounds is None:
                 continue
-            bank_gdf = gpd.read_file(channel["bank_shp_path"])
+            measure_range = bounds["measure_range"]
+            cut_sections = bounds["cut_sections"]
+            bank_gdf = channel.get("processing_banks_gdf")
+            if bank_gdf is None or bank_gdf.empty:
+                bank_gdf = channel.get("banks_gdf")
+            if bank_gdf is None or bank_gdf.empty:
+                bank_gdf = gpd.read_file(channel["bank_shp_path"])
             for bank_index, bank_line in enumerate(DTMChannelModifier._line_strings(bank_gdf), start=1):
-                selected_lines = DTMChannelModifier._line_parts_by_centerline_measure_range(
+                selected_lines = DTMChannelModifier._line_parts_by_cross_section_measure_range(
                     bank_line=bank_line,
                     centerline=channel["centerline"],
                     measure_range=measure_range,
+                    cut_sections=cut_sections,
                 )
                 for part_index, line in enumerate(selected_lines, start=1):
+                    coords = list(line.coords)
+                    start_cut = DTMChannelModifier._endpoint_cross_section_cut_label(
+                        Point(coords[0][:2]),
+                        role=role,
+                        cut_sections=cut_sections,
+                    )
+                    end_cut = DTMChannelModifier._endpoint_cross_section_cut_label(
+                        Point(coords[-1][:2]),
+                        role=role,
+                        cut_sections=cut_sections,
+                    )
                     rows.append(
                         {
                             "Channel": channel["name"][:80],
@@ -830,12 +854,68 @@ class ExportMixin:
                             "PartId": part_index,
                             "FromM": float(measure_range[0]),
                             "ToM": float(measure_range[1]),
+                            "StartCut": start_cut,
+                            "EndCut": end_cut,
                             "geometry": line,
                         }
                     )
 
-        columns = ["Channel", "Role", "BankId", "PartId", "FromM", "ToM", "geometry"]
+        columns = [
+            "Channel",
+            "Role",
+            "BankId",
+            "PartId",
+            "FromM",
+            "ToM",
+            "StartCut",
+            "EndCut",
+            "geometry",
+        ]
         return gpd.GeoDataFrame(rows, columns=columns, geometry="geometry", crs=crs)
+
+    @staticmethod
+    def _main_junction_cross_section_bounds(channel, junction_point):
+        bank_lines = DTMChannelModifier._line_strings(channel["banks_gdf"])
+        sections = DTMChannelModifier._cross_sections_in_file_order(
+            cross_section_csv=channel["cross_section_csv"],
+            centerline=channel["centerline"],
+            bank_lines=bank_lines,
+        )
+        sections.sort(key=lambda section: section["centerline_measure"])
+        if len(sections) < 2:
+            return None
+
+        junction_measure = channel["centerline"].project(junction_point)
+        lower = [
+            section for section in sections
+            if section["centerline_measure"] < junction_measure
+        ]
+        upper = [
+            section for section in sections
+            if section["centerline_measure"] > junction_measure
+        ]
+
+        if lower and upper:
+            start_section = max(lower, key=lambda section: section["centerline_measure"])
+            end_section = min(upper, key=lambda section: section["centerline_measure"])
+        else:
+            nearest = sorted(
+                sections,
+                key=lambda section: abs(section["centerline_measure"] - junction_measure),
+            )[:2]
+            if len(nearest) < 2:
+                return None
+            nearest.sort(key=lambda section: section["centerline_measure"])
+            start_section, end_section = nearest
+
+        measure_range = (
+            float(start_section["centerline_measure"]),
+            float(end_section["centerline_measure"]),
+        )
+        return {
+            "measure_range": measure_range,
+            "cut_sections": [start_section, end_section],
+        }
 
     @staticmethod
     def _main_junction_cross_section_range(channel, junction_point):
@@ -858,6 +938,55 @@ class ExportMixin:
         return (min(nearest), max(nearest))
 
     @staticmethod
+    def _tributary_junction_cross_section_bounds(channel, endpoint_name):
+        bank_lines = DTMChannelModifier._line_strings(channel["banks_gdf"])
+        sections = DTMChannelModifier._cross_sections_in_file_order(
+            cross_section_csv=channel["cross_section_csv"],
+            centerline=channel["centerline"],
+            bank_lines=bank_lines,
+        )
+        sections.sort(key=lambda section: section["centerline_measure"])
+        if not sections:
+            return None
+
+        endpoint_measure = 0.0 if endpoint_name == "start" else channel["centerline"].length
+        tolerance = max(float(channel["centerline"].length) * 1e-9, 1e-6)
+        if endpoint_name == "start":
+            candidates = [
+                section for section in sections
+                if section["centerline_measure"] > endpoint_measure + tolerance
+            ]
+            section = min(
+                candidates,
+                key=lambda item: item["centerline_measure"],
+                default=None,
+            )
+        else:
+            candidates = [
+                section for section in sections
+                if section["centerline_measure"] < endpoint_measure - tolerance
+            ]
+            section = max(
+                candidates,
+                key=lambda item: item["centerline_measure"],
+                default=None,
+            )
+        if section is None:
+            section = min(
+                sections,
+                key=lambda item: abs(item["centerline_measure"] - endpoint_measure),
+            )
+
+        section_measure = float(section["centerline_measure"])
+        return {
+            "measure_range": (
+                min(float(endpoint_measure), section_measure),
+                max(float(endpoint_measure), section_measure),
+            ),
+            "cut_sections": [section],
+        }
+
+    @staticmethod
     def _tributary_junction_cross_section_range(channel, endpoint_name):
         measures = DTMChannelModifier._cross_section_centerline_measures(
             cross_section_csv=channel["cross_section_csv"],
@@ -868,12 +997,21 @@ class ExportMixin:
             return None
 
         endpoint_measure = 0.0 if endpoint_name == "start" else channel["centerline"].length
+        tolerance = max(float(channel["centerline"].length) * 1e-9, 1e-6)
         if endpoint_name == "start":
-            candidates = [measure for measure in measures if measure >= endpoint_measure]
-            section_measure = min(candidates) if candidates else min(measures, key=lambda measure: abs(measure - endpoint_measure))
+            candidates = [measure for measure in measures if measure > endpoint_measure + tolerance]
+            section_measure = (
+                min(candidates)
+                if candidates
+                else min(measures, key=lambda measure: abs(measure - endpoint_measure))
+            )
         else:
-            candidates = [measure for measure in measures if measure <= endpoint_measure]
-            section_measure = max(candidates) if candidates else min(measures, key=lambda measure: abs(measure - endpoint_measure))
+            candidates = [measure for measure in measures if measure < endpoint_measure - tolerance]
+            section_measure = (
+                max(candidates)
+                if candidates
+                else min(measures, key=lambda measure: abs(measure - endpoint_measure))
+            )
 
         return (min(endpoint_measure, section_measure), max(endpoint_measure, section_measure))
 
@@ -904,20 +1042,35 @@ class ExportMixin:
         return sorted(set(round(measure, 6) for measure in measures))
 
     @staticmethod
-    def _line_parts_by_centerline_measure_range(bank_line, centerline, measure_range):
+    def _line_parts_by_cross_section_measure_range(
+        bank_line,
+        centerline,
+        measure_range,
+        cut_sections=None,
+    ):
         start_measure, end_measure = sorted([float(measure_range[0]), float(measure_range[1])])
         if abs(end_measure - start_measure) <= 1e-6:
             return []
 
+        if cut_sections:
+            pieces = DTMChannelModifier._split_line_at_cross_sections(
+                line=bank_line,
+                cut_sections=cut_sections,
+            )
+        else:
+            coords = list(bank_line.coords)
+            pieces = [
+                LineString([coords[index], coords[index + 1]])
+                for index in range(len(coords) - 1)
+            ]
         selected_segments = []
-        coords = list(bank_line.coords)
-        for index in range(len(coords) - 1):
-            segment = LineString([coords[index], coords[index + 1]])
-            if segment.length <= 0:
+        measure_tolerance = max((end_measure - start_measure) * 1e-9, 1e-6)
+        for segment in pieces:
+            if segment is None or segment.is_empty or segment.length <= 1e-9:
                 continue
             midpoint = segment.interpolate(0.5, normalized=True)
             measure = centerline.project(midpoint)
-            if start_measure <= measure <= end_measure:
+            if start_measure - measure_tolerance <= measure <= end_measure + measure_tolerance:
                 selected_segments.append(segment)
 
         if not selected_segments:
@@ -928,3 +1081,138 @@ class ExportMixin:
             return DTMChannelModifier._line_strings(merged)
         except Exception:
             return selected_segments
+
+    @staticmethod
+    def _line_parts_by_centerline_measure_range(bank_line, centerline, measure_range):
+        return DTMChannelModifier._line_parts_by_cross_section_measure_range(
+            bank_line=bank_line,
+            centerline=centerline,
+            measure_range=measure_range,
+            cut_sections=None,
+        )
+
+    @staticmethod
+    def _endpoint_cross_section_cut_label(point, role, cut_sections, tolerance=1.0):
+        if point is None or point.is_empty:
+            return ""
+        candidates = []
+        for section in cut_sections or []:
+            section_line = section.get("line")
+            if section_line is None or section_line.is_empty:
+                continue
+            distance = float(point.distance(section_line))
+            if distance <= float(tolerance):
+                candidates.append((distance, section))
+        if not candidates:
+            return ""
+        _, section = min(candidates, key=lambda item: item[0])
+        station = section.get("station", "")
+        return f"{role}:{station}"[:80]
+
+    @staticmethod
+    def _split_line_at_cross_sections(line, cut_sections, snap_tolerance=1.0):
+        if line is None or line.is_empty or line.length <= 0:
+            return []
+
+        cut_distances = []
+        for section in cut_sections or []:
+            cut_line = DTMChannelModifier._extended_cross_section_line(
+                section["line"],
+                line,
+            )
+            if cut_line is None or cut_line.is_empty:
+                continue
+
+            intersection = line.intersection(cut_line)
+            points = DTMChannelModifier._points_from_geometry(intersection)
+            if not points and line.distance(cut_line) <= float(snap_tolerance):
+                try:
+                    point_on_line, _ = nearest_points(line, cut_line)
+                    points = [point_on_line]
+                except Exception:
+                    points = []
+
+            for point in points:
+                distance = float(line.project(point))
+                if 1e-6 < distance < float(line.length) - 1e-6:
+                    cut_distances.append(distance)
+
+        if not cut_distances:
+            return [line]
+
+        unique_distances = []
+        for distance in sorted(cut_distances):
+            if not unique_distances or abs(distance - unique_distances[-1]) > 1e-6:
+                unique_distances.append(distance)
+
+        distances = [0.0] + unique_distances + [float(line.length)]
+        pieces = []
+        for start_distance, end_distance in zip(distances[:-1], distances[1:]):
+            piece = DTMChannelModifier._line_substring_by_distance(
+                line,
+                start_distance,
+                end_distance,
+            )
+            if piece is not None and not piece.is_empty and piece.length > 1e-9:
+                pieces.append(piece)
+        return pieces
+
+    @staticmethod
+    def _line_substring_by_distance(line, start_distance, end_distance):
+        length = float(line.length)
+        if length <= 0:
+            return None
+
+        start_distance = float(np.clip(start_distance, 0.0, length))
+        end_distance = float(np.clip(end_distance, 0.0, length))
+        if end_distance < start_distance:
+            start_distance, end_distance = end_distance, start_distance
+        if end_distance - start_distance <= 1e-9:
+            return None
+
+        coords = [(float(coord[0]), float(coord[1])) for coord in line.coords]
+        if len(coords) < 2:
+            return None
+
+        def interpolate_segment(p0, p1, fraction):
+            return (
+                float(p0[0] + (p1[0] - p0[0]) * fraction),
+                float(p0[1] + (p1[1] - p0[1]) * fraction),
+            )
+
+        output_coords = []
+        traversed = 0.0
+        tolerance = 1e-9
+        for index in range(len(coords) - 1):
+            p0 = coords[index]
+            p1 = coords[index + 1]
+            segment_length = float(Point(p0).distance(Point(p1)))
+            if segment_length <= 0:
+                continue
+            next_traversed = traversed + segment_length
+            if next_traversed < start_distance - tolerance:
+                traversed = next_traversed
+                continue
+            if traversed > end_distance + tolerance:
+                break
+
+            local_start = max(start_distance, traversed)
+            local_end = min(end_distance, next_traversed)
+            if local_end < local_start - tolerance:
+                traversed = next_traversed
+                continue
+
+            start_fraction = (local_start - traversed) / segment_length
+            end_fraction = (local_end - traversed) / segment_length
+            start_point = interpolate_segment(p0, p1, start_fraction)
+            end_point = interpolate_segment(p0, p1, end_fraction)
+
+            if not output_coords or Point(output_coords[-1]).distance(Point(start_point)) > 1e-8:
+                output_coords.append(start_point)
+            if Point(output_coords[-1]).distance(Point(end_point)) > 1e-8:
+                output_coords.append(end_point)
+            traversed = next_traversed
+
+        if len(output_coords) < 2:
+            return None
+        return LineString(output_coords)

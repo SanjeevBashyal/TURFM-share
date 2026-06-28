@@ -403,7 +403,7 @@ class JunctionInterpolationMixin:
             return context
 
         junction_bank_polygon = DTMChannelModifier._junction_bank_polygon_from_clipped_banks(
-            clipped_banks,
+            raw_clipped_banks,
             bank_lines=bank_lines,
             junction_point=junction_point,
         )
@@ -948,25 +948,19 @@ class JunctionInterpolationMixin:
         if junction_bank_polygon is None or junction_bank_polygon.is_empty:
             return None
         offset = max(float(offset_m), 0.0)
-        if offset <= 1e-9 or not bank_lines:
+        if offset <= 1e-9:
             return junction_bank_polygon
 
-        bank_strips = [
-            line.buffer(offset, cap_style=2, join_style=2)
-            for line in bank_lines
-            if line is not None and not line.is_empty
-        ]
-        if not bank_strips:
+        inner_polygon = junction_bank_polygon.buffer(-offset, join_style=2)
+        if inner_polygon is None or inner_polygon.is_empty:
             return junction_bank_polygon
-
-        inner_polygon = junction_bank_polygon.difference(unary_union(bank_strips))
-        if inner_polygon is None or inner_polygon.is_empty:
-            inner_polygon = junction_bank_polygon.buffer(-offset, join_style=2)
-        if inner_polygon is None or inner_polygon.is_empty:
-            return None
         if not inner_polygon.is_valid:
             inner_polygon = inner_polygon.buffer(0)
-        return inner_polygon if inner_polygon is not None and not inner_polygon.is_empty else None
+        if inner_polygon is None or inner_polygon.is_empty:
+            return junction_bank_polygon
+        if inner_polygon.geom_type == "MultiPolygon" and len(inner_polygon.geoms) > 1:
+            return junction_bank_polygon
+        return inner_polygon
 
     @staticmethod
     def _fresh_junction_inner_bed_elevation(
